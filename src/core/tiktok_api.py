@@ -1,7 +1,9 @@
 import json
 import re
+import time
 from pathlib import Path
-from typing import Optional, Iterator, Dict
+from typing import Optional, Iterator, Dict, Tuple
+from urllib.parse import urljoin
 
 from http_utils.http_client import HttpClient
 from utils.enums import StatusCode, TikTokError
@@ -480,9 +482,16 @@ class TikTokAPI:
 
         return followers
 
-    def get_live_url(self, room_id: str) -> str | None:
+    def get_live_url(self, room_id: str, prefer_m3u8: bool = False) -> str | None:
         """
-        Return the cdn (flv or m3u8) of the streaming
+        Return the cdn (flv or m3u8) of the streaming.
+        
+        Args:
+            room_id: TikTok room ID
+            prefer_m3u8: If True, prefer M3U8 format over FLV
+            
+        Returns:
+            URL to the live stream (FLV or M3U8)
         """
         data = self._safe_get(
             f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
@@ -502,6 +511,17 @@ class TikTokAPI:
             logger.warning(
                 "No SDK stream data found. Falling back to legacy URLs. Consider contacting the developer to update the code."
             )
+            # Try M3U8 first if preferred
+            if prefer_m3u8:
+                m3u8_url = (
+                    stream_url.get("hls_pull_url_map", {}).get("FULL_HD1")
+                    or stream_url.get("hls_pull_url_map", {}).get("HD1")
+                    or stream_url.get("hls_pull_url_map", {}).get("SD2")
+                    or stream_url.get("hls_pull_url_map", {}).get("SD1")
+                    or stream_url.get("hls_pull_url", "")
+                )
+                if m3u8_url:
+                    return m3u8_url
             return (
                 stream_url.get("flv_pull_url", {}).get("FULL_HD1")
                 or stream_url.get("flv_pull_url", {}).get("HD1")
@@ -525,17 +545,95 @@ class TikTokAPI:
 
         best_level = -1
         best_flv = None
+        best_hls = None
         for sdk_key, entry in sdk_data.items():
             level = level_map.get(sdk_key, -1)
             stream_main = entry.get("main", {})
             if level > best_level:
                 best_level = level
                 best_flv = stream_main.get("flv")
+                best_hls = stream_main.get("hls")
 
-        if not best_flv and data.get("status_code") == 4003110:
+        if not best_flv and not best_hls and data.get("status_code") == 4003110:
             raise UserLiveError(TikTokError.LIVE_RESTRICTION)
 
-        return best_flv
+        # Return M3U8 if preferred and available
+        if prefer_m3u8 and best_hls:
+            logger.debug(f"Using M3U8 stream URL: {best_hls[:80]}...")
+            return best_hls
+        
+        if best_flv:
+            return best_flv
+        
+        # Fallback to M3U8 if FLV not available
+        return best_hls
+
+    def get_live_url_both(self, room_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Return both FLV and M3U8 URLs for the streaming.
+        
+        Args:
+            room_id: TikTok room ID
+            
+        Returns:
+            Tuple of (flv_url, m3u8_url)
+        """
+        data = self._safe_get(
+            f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+        ).json()
+
+        if "This account is private" in data:
+            raise UserLiveError(TikTokError.ACCOUNT_PRIVATE)
+
+        stream_url = data.get("data", {}).get("stream_url", {})
+
+        sdk_data_str = (
+            stream_url.get("live_core_sdk_data", {})
+            .get("pull_data", {})
+            .get("stream_data")
+        )
+        
+        flv_url = None
+        m3u8_url = None
+        
+        if not sdk_data_str:
+            # Legacy URLs
+            flv_url = (
+                stream_url.get("flv_pull_url", {}).get("FULL_HD1")
+                or stream_url.get("flv_pull_url", {}).get("HD1")
+                or stream_url.get("flv_pull_url", {}).get("SD2")
+                or stream_url.get("flv_pull_url", {}).get("SD1")
+            )
+            m3u8_url = (
+                stream_url.get("hls_pull_url_map", {}).get("FULL_HD1")
+                or stream_url.get("hls_pull_url_map", {}).get("HD1")
+                or stream_url.get("hls_pull_url_map", {}).get("SD2")
+                or stream_url.get("hls_pull_url_map", {}).get("SD1")
+                or stream_url.get("hls_pull_url", "")
+            )
+        else:
+            # SDK stream data
+            sdk_data = json.loads(sdk_data_str).get("data", {})
+            qualities = (
+                stream_url.get("live_core_sdk_data", {})
+                .get("pull_data", {})
+                .get("options", {})
+                .get("qualities", [])
+            )
+            
+            if qualities:
+                level_map = {q["sdk_key"]: q["level"] for q in qualities}
+                best_level = -1
+                
+                for sdk_key, entry in sdk_data.items():
+                    level = level_map.get(sdk_key, -1)
+                    stream_main = entry.get("main", {})
+                    if level > best_level:
+                        best_level = level
+                        flv_url = stream_main.get("flv")
+                        m3u8_url = stream_main.get("hls")
+        
+        return flv_url, m3u8_url
 
     def download_live_stream(
         self, 
@@ -558,3 +656,167 @@ class TikTokAPI:
         for chunk in stream.iter_content(chunk_size=chunk_size):
             if chunk:
                 yield chunk
+
+    def _parse_m3u8_playlist(self, m3u8_content: str, base_url: str) -> list[str]:
+        """
+        Parse M3U8 playlist content and extract segment URLs.
+        
+        Args:
+            m3u8_content: Content of the M3U8 playlist
+            base_url: Base URL for resolving relative segment URLs
+            
+        Returns:
+            List of absolute segment URLs
+        """
+        segments = []
+        for line in m3u8_content.strip().split('\n'):
+            line = line.strip()
+            # Skip comments and metadata lines
+            if not line or line.startswith('#'):
+                continue
+            # Build absolute URL for segment
+            if line.startswith('http://') or line.startswith('https://'):
+                segments.append(line)
+            else:
+                segments.append(urljoin(base_url, line))
+        return segments
+
+    def download_m3u8_stream(
+        self, 
+        m3u8_url: str, 
+        timeout: int = DEFAULT_STREAM_TIMEOUT,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        poll_interval: float = 2.0
+    ) -> Iterator[bytes]:
+        """
+        Generator that yields chunks from an M3U8/HLS live stream.
+        
+        This method continuously fetches the M3U8 playlist and downloads
+        new segments as they become available.
+        
+        Args:
+            m3u8_url: The URL to the M3U8 playlist
+            timeout: Connection timeout in seconds
+            chunk_size: Size of chunks to yield per segment
+            poll_interval: How often to poll for new segments (seconds)
+            
+        Yields:
+            Bytes chunks from the stream segments
+        """
+        # Track downloaded segments to avoid duplicates
+        downloaded_segments: set[str] = set()
+        consecutive_empty = 0
+        max_consecutive_empty = 15  # Stop after ~30 seconds of no new segments
+        
+        # Get base URL for resolving relative segment URLs
+        base_url = m3u8_url.rsplit('/', 1)[0] + '/'
+        
+        logger.debug(f"Starting M3U8 stream download from: {m3u8_url[:80]}...")
+        
+        while consecutive_empty < max_consecutive_empty:
+            try:
+                # Fetch the M3U8 playlist
+                response = self._http_client_stream.get(m3u8_url, timeout=timeout)
+                if response.status_code != 200:
+                    logger.debug(f"M3U8 playlist fetch failed with status {response.status_code}")
+                    consecutive_empty += 1
+                    time.sleep(poll_interval)
+                    continue
+                
+                playlist_content = response.text
+                
+                # Check if this is a master playlist (contains other playlists)
+                if '#EXT-X-STREAM-INF' in playlist_content:
+                    # Parse master playlist and get the highest quality stream
+                    best_url = self._get_best_variant_from_master(playlist_content, base_url)
+                    if best_url:
+                        m3u8_url = best_url
+                        base_url = m3u8_url.rsplit('/', 1)[0] + '/'
+                        logger.debug(f"Switched to variant playlist: {m3u8_url[:80]}...")
+                        continue
+                
+                # Parse segments from the playlist
+                segments = self._parse_m3u8_playlist(playlist_content, base_url)
+                
+                # Download new segments
+                new_segments_found = False
+                for segment_url in segments:
+                    if segment_url in downloaded_segments:
+                        continue
+                    
+                    downloaded_segments.add(segment_url)
+                    new_segments_found = True
+                    consecutive_empty = 0
+                    
+                    try:
+                        # Download the segment
+                        seg_response = self._http_client_stream.get(
+                            segment_url, 
+                            stream=True, 
+                            timeout=timeout
+                        )
+                        if seg_response.status_code == 200:
+                            for chunk in seg_response.iter_content(chunk_size=chunk_size):
+                                if chunk:
+                                    yield chunk
+                        else:
+                            logger.debug(f"Segment download failed: {segment_url[:60]}... (status {seg_response.status_code})")
+                    except Exception as e:
+                        logger.debug(f"Error downloading segment: {e}")
+                
+                if not new_segments_found:
+                    consecutive_empty += 1
+                
+                # Check for end of stream marker
+                if '#EXT-X-ENDLIST' in playlist_content:
+                    logger.debug("M3U8 stream ended (ENDLIST marker found)")
+                    break
+                
+                # Wait before polling for new segments
+                time.sleep(poll_interval)
+                
+            except Exception as e:
+                logger.debug(f"Error fetching M3U8 playlist: {e}")
+                consecutive_empty += 1
+                time.sleep(poll_interval)
+        
+        logger.debug(f"M3U8 stream download ended. Downloaded {len(downloaded_segments)} segments.")
+
+    def _get_best_variant_from_master(self, master_content: str, base_url: str) -> Optional[str]:
+        """
+        Parse a master M3U8 playlist and return the URL of the highest quality variant.
+        
+        Args:
+            master_content: Content of the master M3U8 playlist
+            base_url: Base URL for resolving relative URLs
+            
+        Returns:
+            URL of the best quality variant playlist, or None if not found
+        """
+        best_bandwidth = -1
+        best_url = None
+        
+        lines = master_content.strip().split('\n')
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line.startswith('#EXT-X-STREAM-INF'):
+                # Extract bandwidth
+                bandwidth_match = re.search(r'BANDWIDTH=(\d+)', line)
+                if bandwidth_match:
+                    bandwidth = int(bandwidth_match.group(1))
+                    # Next line should be the URL
+                    if i + 1 < len(lines):
+                        url_line = lines[i + 1].strip()
+                        if url_line and not url_line.startswith('#'):
+                            if bandwidth > best_bandwidth:
+                                best_bandwidth = bandwidth
+                                if url_line.startswith('http://') or url_line.startswith('https://'):
+                                    best_url = url_line
+                                else:
+                                    best_url = urljoin(base_url, url_line)
+        
+        return best_url
+
+    def is_m3u8_url(self, url: str) -> bool:
+        """Check if a URL is an M3U8/HLS stream."""
+        return '.m3u8' in url.lower() or 'hls' in url.lower()

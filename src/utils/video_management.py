@@ -74,16 +74,30 @@ class VideoManagement:
     @staticmethod
     def convert_flv_to_mp4(file: str) -> Optional[str]:
         """
-        Convert the video from FLV format to MP4 format.
+        Convert the video from FLV or TS format to MP4 format.
         Fixes audio/video sync issues by re-encoding with proper timestamp handling.
         
         Args:
-            file: Path to the FLV file (with _flv.mp4 extension)
+            file: Path to the input file
             
         Returns:
             Path to the converted MP4 file, or None if conversion failed
         """
-        output_file = file.replace("_flv.mp4", ".mp4")
+        if file.endswith("_flv.mp4"):
+            output_file = file.replace("_flv.mp4", ".mp4")
+        elif file.endswith("_hls.ts"):
+            output_file = file.replace("_hls.ts", ".mp4")
+        elif file.endswith(".ts"):
+            output_file = file.replace(".ts", ".mp4")
+        else:
+            # Generic fallback: strip extension and append .mp4
+            file_path = Path(file)
+            output_file = str(file_path.with_suffix(".mp4"))
+            
+        # Ensure we don't overwrite input
+        if output_file == file:
+            output_file = str(Path(file).with_stem(Path(file).stem + "_converted").with_suffix(".mp4"))
+
         file_size = VideoManagement.get_file_size_mb(file)
         
         logger.info(f"Converting {file} to MP4 format... ({file_size:.1f} MB)")

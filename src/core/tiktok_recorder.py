@@ -662,6 +662,7 @@ class TikTokRecorder:
         output,
         duration,
         use_telegram,
+        use_m3u8=False,
     ):
         # Setup TikTok API client
         self.tiktok = TikTokAPI(proxy=proxy, cookies=cookies)
@@ -676,6 +677,7 @@ class TikTokRecorder:
         self.automatic_interval = automatic_interval
         self.duration = duration
         self.output = output
+        self.use_m3u8 = use_m3u8
 
         # Upload Settings
         self.use_telegram = use_telegram
@@ -926,8 +928,13 @@ class TikTokRecorder:
                 logger.error(f"Unexpected error: {ex}\n")
                 jitter_sleep(30)  # Wait with jitter before retrying
 
-    def _get_output_path(self, user: str) -> str:
-        """Generate the output file path for recording."""
+    def _get_output_path(self, user: str, is_m3u8: bool = False) -> str:
+        """Generate the output file path for recording.
+        
+        Args:
+            user: TikTok username
+            is_m3u8: Whether recording M3U8/HLS format (uses .ts extension)
+        """
         current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
         
         # Default to 'videos' folder if no output specified
@@ -940,8 +947,11 @@ class TikTokRecorder:
         
         if not output_dir.endswith(os.sep):
             output_dir += os.sep
-            
-        return f"{output_dir}TK_{user}_{current_date}_flv.mp4"
+        
+        # Use .ts extension for M3U8/HLS recordings, .mp4 for FLV
+        extension = "ts" if is_m3u8 else "mp4"
+        format_tag = "hls" if is_m3u8 else "flv"
+        return f"{output_dir}TK_{user}_{current_date}_{format_tag}.{extension}"
 
     def _flush_buffer(self, buffer: bytearray, out_file) -> int:
         """Flush buffer to file and return bytes written."""
@@ -965,7 +975,7 @@ class TikTokRecorder:
                 logger.debug(f"Checking if room {room_id} is still alive... (attempt {attempt + 1}/{max_retries})")
                 if self.tiktok.is_room_alive(room_id):
                     logger.debug("Room is alive, getting fresh URL...")
-                    url = self.tiktok.get_live_url(room_id)
+                    url = self.tiktok.get_live_url(room_id, prefer_m3u8=self.use_m3u8)
                     if url:
                         logger.debug(f"Got fresh URL: {url[:80]}...")
                     return url
@@ -989,17 +999,22 @@ class TikTokRecorder:
             user: TikTok username
             room_id: TikTok room ID
         """
-        live_url = self.tiktok.get_live_url(room_id)
+        live_url = self.tiktok.get_live_url(room_id, prefer_m3u8=self.use_m3u8)
         if not live_url:
             raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
-        output = self._get_output_path(user)
+        # Determine if we're using M3U8 format
+        is_m3u8 = self.tiktok.is_m3u8_url(live_url)
+        
+        output = self._get_output_path(user, is_m3u8=is_m3u8)
 
         if self.duration:
             logger.info(f"Started recording for {self.duration} seconds ")
         else:
             logger.info("Started recording...")
 
+        stream_type = "M3U8/HLS" if is_m3u8 else "FLV"
+        logger.info(f"Stream format: {stream_type}")
         logger.info(f"Output: {output}")
         
         buffer = bytearray()
@@ -1045,9 +1060,14 @@ class TikTokRecorder:
                             logger.info(f"Recording progress: {elapsed:.0f}s elapsed, {total_bytes_written / (1024*1024):.2f} MB written")
                             last_progress_log = current_time
 
-                        # Download stream chunks
+                        # Download stream chunks - use appropriate method based on stream type
                         chunks_in_batch = 0
-                        for chunk in self.tiktok.download_live_stream(live_url):
+                        stream_generator = (
+                            self.tiktok.download_m3u8_stream(live_url) 
+                            if is_m3u8 
+                            else self.tiktok.download_live_stream(live_url)
+                        )
+                        for chunk in stream_generator:
                             chunks_in_batch += 1
                             buffer.extend(chunk)
                             if len(buffer) >= RecordingConfig.BUFFER_SIZE:
@@ -1074,6 +1094,8 @@ class TikTokRecorder:
                             new_url = self._try_get_fresh_url(room_id)
                             if new_url:
                                 live_url = new_url
+                                # Update is_m3u8 in case format changed
+                                is_m3u8 = self.tiktok.is_m3u8_url(live_url)
                                 logger.info("Reconnected with fresh stream URL.")
                                 reconnect_attempts = 0  # Reset counter on success
                                 continue
@@ -1092,6 +1114,7 @@ class TikTokRecorder:
                             new_url = self._try_get_fresh_url(room_id)
                             if new_url:
                                 live_url = new_url
+                                is_m3u8 = self.tiktok.is_m3u8_url(live_url)
                                 logger.info("Got fresh stream URL after connection error.")
                             elif not self.tiktok.is_room_alive(room_id):
                                 logger.info("User is no longer live.")
@@ -1144,10 +1167,13 @@ class TikTokRecorder:
         status_tracker.stop_recording_tracking()
         
         logger.info(f"Recording finished: {output}\n")
-        VideoManagement.convert_flv_to_mp4(output)
+        converted_path = VideoManagement.convert_flv_to_mp4(output)
+        
+        # Use converted file if available, otherwise fallback to original
+        final_path = converted_path if converted_path else output
 
         if self.use_telegram:
-            Telegram().upload(output.replace("_flv.mp4", ".mp4"))
+            Telegram().upload(final_path)
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()

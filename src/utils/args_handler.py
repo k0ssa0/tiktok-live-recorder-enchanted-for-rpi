@@ -120,6 +120,16 @@ def parse_args():
         help="Clear all log files from ~/tiktok-recorder-logs/ before starting.",
     )
 
+    parser.add_argument(
+        "-m3u8",
+        dest="use_m3u8",
+        action="store_true",
+        help=(
+            "Prefer M3U8/HLS format over FLV for recording.\n"
+            "M3U8 can be more stable in some network conditions."
+        ),
+    )
+
     args = parser.parse_args()
 
     return args

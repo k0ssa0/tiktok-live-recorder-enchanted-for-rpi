@@ -31,7 +31,7 @@ def setup_signal_handlers():
 
 
 def record_user(
-    user, url, room_id, mode, interval, proxy, output, duration, use_telegram, cookies
+    user, url, room_id, mode, interval, proxy, output, duration, use_telegram, cookies, use_m3u8=False
 ):
     from core.tiktok_recorder import TikTokRecorder
     from utils.logger_manager import logger
@@ -48,6 +48,7 @@ def record_user(
             output=output,
             duration=duration,
             use_telegram=use_telegram,
+            use_m3u8=use_m3u8,
         ).run()
     except KeyboardInterrupt:
         logger.info("Recording interrupted by user.")
@@ -74,6 +75,7 @@ def run_recordings(args, mode, cookies):
                     args.duration,
                     args.telegram,
                     cookies,
+                    args.use_m3u8,
                 ),
             )
             p.start()
@@ -106,6 +108,7 @@ def run_recordings(args, mode, cookies):
             args.duration,
             args.telegram,
             cookies,
+            args.use_m3u8,
         )
 
 
