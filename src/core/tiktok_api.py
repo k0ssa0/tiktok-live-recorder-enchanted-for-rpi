@@ -1,8 +1,7 @@
 import json
-import os
 import re
 from pathlib import Path
-from typing import Optional, Iterator, Dict, Any
+from typing import Optional, Iterator, Dict
 
 from http_utils.http_client import HttpClient
 from utils.enums import StatusCode, TikTokError
@@ -355,7 +354,7 @@ class TikTokAPI:
             return None
 
     @staticmethod
-    def clear_cached_room_id(user: str = None):
+    def clear_cached_room_id(user: Optional[str] = None):
         """Clear cached room_id for a user or all users."""
         try:
             if user is None:

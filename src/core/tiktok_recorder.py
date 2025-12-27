@@ -4,7 +4,6 @@ import select
 import sys
 import termios
 import time
-import tty
 from datetime import datetime, timedelta
 from http.client import HTTPException
 from threading import Thread, Event
@@ -13,7 +12,7 @@ from typing import Optional
 from requests import RequestException
 
 from core.tiktok_api import TikTokAPI
-from utils.logger_manager import logger, LoggerManager
+from utils.logger_manager import logger
 from utils.video_management import VideoManagement
 from upload.telegram import Telegram
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError, SigningAPIError
@@ -141,7 +140,7 @@ class RaspberryPiLED:
         """Release control of green LED."""
         if not self.green_controlled:
             return
-        if self.green_original_trigger:
+        if self.green_original_trigger and self.green_led_path:
             self._write_to_led(self.green_led_path, "trigger", self.green_original_trigger)
             logger.debug(f"Green LED restored to trigger: {self.green_original_trigger}")
         self.green_controlled = False
@@ -150,7 +149,7 @@ class RaspberryPiLED:
         """Release control of red LED."""
         if not self.red_controlled:
             return
-        if self.red_original_trigger:
+        if self.red_original_trigger and self.red_led_path:
             self._write_to_led(self.red_led_path, "trigger", self.red_original_trigger)
             logger.debug(f"Red LED restored to trigger: {self.red_original_trigger}")
         self.red_controlled = False
@@ -415,7 +414,7 @@ def start_input_listener():
                                 if new_cookie and new_cookie.lower() != 'cancel':
                                     try:
                                         save_cookies(new_cookie)
-                                        print(f"[*] Cookie updated!")
+                                        print("[*] Cookie updated!")
                                         print(f"[*] New: {new_cookie[:10]}...{new_cookie[-5:]}\n")
                                         logger.info("Cookies updated via interactive input")
                                     except Exception as e:
@@ -456,7 +455,7 @@ def start_input_listener():
                             opt = _getch_with_timeout(fd, 10.0).lower()
                             print(opt if opt else "")
                             if opt == 'a':
-                                TikTokAPI.clear_cached_room_id(None)
+                                TikTokAPI.clear_cached_room_id()  # No argument clears all
                                 print("[*] Cleared all cached room IDs.\n")
                             elif opt == 'u':
                                 TikTokAPI.clear_cached_room_id(user)
@@ -497,7 +496,7 @@ def start_input_listener():
         finally:
             try:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            except:
+            except Exception:
                 pass
     
     def listener_readline():
@@ -532,7 +531,7 @@ def start_input_listener():
                                     if new_cookie and new_cookie.lower() != 'cancel':
                                         try:
                                             save_cookies(new_cookie)
-                                            print(f"[*] Cookie updated!\n")
+                                            print("[*] Cookie updated!\n")
                                         except Exception as e:
                                             print(f"[!] Error: {e}\n")
                     
@@ -630,7 +629,6 @@ def jitter_sleep(base_seconds: float, min_mult: float = RecordingConfig.JITTER_M
     # Sleep in small intervals to allow for force recheck interruption
     sleep_interval = 0.5  # Check every 0.5 seconds for responsiveness
     elapsed = 0.0
-    command_check_counter = 0
     while elapsed < jittered:
         # Check local force recheck event (from direct terminal input or remote thread)
         if status_tracker.force_recheck.is_set():
@@ -747,6 +745,8 @@ class TikTokRecorder:
             self.followers_mode()
 
     def manual_mode(self):
+        if not self.room_id:
+            raise UserLiveError(f"@{self.user}: Room ID not available")
         if not self.tiktok.is_room_alive(self.room_id):
             raise UserLiveError(f"@{self.user}: {TikTokError.USER_NOT_CURRENTLY_LIVE}")
 
@@ -781,6 +781,8 @@ class TikTokRecorder:
                 
                 status_tracker.current_state = "fetching room ID"
                 self.room_id = self.tiktok.get_room_id_from_user(self.user)
+                if not self.room_id:
+                    raise UserLiveError(f"@{self.user}: Could not retrieve room ID")
                 status_tracker.room_id = self.room_id
                 logger.debug(f"Room ID retrieved: {self.room_id}")
                 
@@ -829,7 +831,7 @@ class TikTokRecorder:
                 logger.error(f"Signing API error: {ex}")
                 pi_led.error_on()
                 session_manager.update(state="error")
-                logger.info(f"Signing API unavailable. Waiting 10 seconds before retry...\n")
+                logger.info("Signing API unavailable. Waiting 10 seconds before retry...\n")
                 jitter_sleep(10)
                 pi_led.error_off()
 
@@ -838,7 +840,7 @@ class TikTokRecorder:
                 logger.error(f"API error: {ex}")
                 pi_led.error_on()  # Red LED on for error
                 session_manager.update(state="error")
-                logger.info(f"Waiting 30 seconds before retry...\n")
+                logger.info("Waiting 30 seconds before retry...\n")
                 jitter_sleep(30)
                 pi_led.error_off()  # Clear error after wait
 
@@ -1044,10 +1046,8 @@ class TikTokRecorder:
                             last_progress_log = current_time
 
                         # Download stream chunks
-                        chunk_received = False
                         chunks_in_batch = 0
                         for chunk in self.tiktok.download_live_stream(live_url):
-                            chunk_received = True
                             chunks_in_batch += 1
                             buffer.extend(chunk)
                             if len(buffer) >= RecordingConfig.BUFFER_SIZE:
