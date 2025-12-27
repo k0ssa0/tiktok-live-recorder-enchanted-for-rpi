@@ -585,6 +585,26 @@ def start_input_listener():
     return thread
 
 
+def start_remote_command_listener():
+    """Start a thread to listen for remote commands via SessionManager."""
+    def remote_listener():
+        while True:
+            command = session_manager.read_command()
+            if command:
+                if command == 'status':
+                    # Log status so it appears in the log file (and thus the viewer)
+                    # We use logger.info but with a marker or just as is
+                    logger.info(status_tracker.get_status())
+                elif command == 'force_recheck':
+                    logger.info("Remote force recheck requested")
+                    status_tracker.force_recheck.set()
+            time.sleep(0.5)
+            
+    thread = Thread(target=remote_listener, daemon=True)
+    thread.start()
+    return thread
+
+
 def jitter_sleep(base_seconds: float, min_mult: float = RecordingConfig.JITTER_MIN, 
                  max_mult: float = RecordingConfig.JITTER_MAX) -> float:
     """
@@ -612,20 +632,11 @@ def jitter_sleep(base_seconds: float, min_mult: float = RecordingConfig.JITTER_M
     elapsed = 0.0
     command_check_counter = 0
     while elapsed < jittered:
-        # Check local force recheck event (from direct terminal input)
+        # Check local force recheck event (from direct terminal input or remote thread)
         if status_tracker.force_recheck.is_set():
             logger.info("Force recheck triggered!")
             status_tracker.force_recheck.clear()
             return elapsed  # Return early
-        
-        # Check for remote commands every 2 seconds (every 4 iterations)
-        command_check_counter += 1
-        if command_check_counter >= 4:
-            command_check_counter = 0
-            command = session_manager.read_command()
-            if command == 'force_recheck':
-                logger.info("Force recheck triggered from remote session!")
-                return elapsed  # Return early
         
         time.sleep(min(sleep_interval, jittered - elapsed))
         elapsed += sleep_interval
@@ -744,8 +755,10 @@ class TikTokRecorder:
     def automatic_mode(self):
         # Start input listener for interactive status
         listener_thread = start_input_listener()
+        remote_listener_thread = start_remote_command_listener()
         logger.info("Press Enter anytime to see current status\n")
         logger.debug(f"Input listener thread started: {listener_thread.is_alive()}")
+        logger.debug(f"Remote listener thread started: {remote_listener_thread.is_alive()}")
         
         # Turn off LED at start (idle state)
         pi_led.turn_off()

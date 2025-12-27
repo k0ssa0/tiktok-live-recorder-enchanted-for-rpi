@@ -154,9 +154,15 @@ class SessionManager:
             
             # Make stdout non-blocking for tail
             import fcntl
-            fd = tail_process.stdout.fileno()
-            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            fd_tail = tail_process.stdout.fileno()
+            fl = fcntl.fcntl(fd_tail, fcntl.F_GETFL)
+            fcntl.fcntl(fd_tail, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            
+            print(f"[*] Reconnecting to session output...")
+            print(f"[*] Tailing: {log_file}")
+            print("-" * 55)
+            print("  Commands: [f]=force recheck  [Enter]=status  [Ctrl+C]=detach")
+            print("-" * 55 + "\n")
             
             # Monitor both the tail process and user input
             while True:
@@ -167,30 +173,40 @@ class SessionManager:
                     tail_process.terminate()
                     break
                 
-                # Check for user input (non-blocking)
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    user_input = sys.stdin.readline().strip().lower()
-                    if user_input == 'f':
-                        print("\n[?] Force recheck now? (y/n): ", end='', flush=True)
-                        if select.select([sys.stdin], [], [], 10.0)[0]:
-                            confirm = sys.stdin.readline().strip().lower()
-                            if confirm in ('y', 'yes'):
-                                self.send_command('force_recheck')
-                                print("[*] Force recheck command sent!\n")
+                # Wait for input from either stdin or tail output
+                # select allows us to wait efficiently without busy looping
+                rlist, _, _ = select.select([sys.stdin, tail_process.stdout], [], [], 0.1)
+                
+                for source in rlist:
+                    if source is sys.stdin:
+                        # Handle User Input
+                        user_input = sys.stdin.readline().strip().lower()
+                        if user_input == 'f':
+                            print("\n[?] Force recheck now? (y/n): ", end='', flush=True)
+                            # Wait for confirmation with timeout
+                            if select.select([sys.stdin], [], [], 10.0)[0]:
+                                confirm = sys.stdin.readline().strip().lower()
+                                if confirm in ('y', 'yes'):
+                                    self.send_command('force_recheck')
+                                    print("[*] Force recheck command sent!\n")
+                                else:
+                                    print("[*] Cancelled.\n")
                             else:
-                                print("[*] Cancelled.\n")
-                        else:
-                            print("\n[*] Timeout.\n")
-                
-                # Read and print tail output (non-blocking)
-                try:
-                    line = tail_process.stdout.readline()
-                    if line:
-                        print(line, end='')
-                except IOError:
-                    pass  # No data available
-                
-                time.sleep(0.05)  # Small sleep to prevent CPU spinning
+                                print("\n[*] Timeout.\n")
+                        elif user_input == '': # Enter or empty input
+                             self.send_command('status')
+                    
+                    elif source is tail_process.stdout:
+                        # Handle Log Output
+                        try:
+                            # Read all available lines
+                            while True:
+                                line = tail_process.stdout.readline()
+                                if not line:
+                                    break
+                                print(line, end='')
+                        except IOError:
+                            pass  # No more data available right now
                     
         except KeyboardInterrupt:
             print("\n" + "-" * 55)
